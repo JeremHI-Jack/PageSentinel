@@ -55,3 +55,6 @@ python main.py
 - Quitting may wait for an in-progress HTTP request to finish.
 - Adjusting a saved monitor's comparison options requires removing and adding that monitor again; its snapshot files remain untouched.
 - Counters are session-only.
+
+<img width="1030" height="732" alt="image" src="https://github.com/user-attachments/assets/4039a602-3ee1-4fef-90c0-e7acc9076b73" />
+
