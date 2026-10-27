@@ -1,8 +1,9 @@
-"""PageSentinel - local web page change monitoring (Python 3.10+)."""
+"""PageSentinel - monitor HTML, JSON, text and binary resources (Python 3.10+)."""
 
 import difflib
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -141,6 +142,99 @@ def clean_html(payload: bytes, mode: str, selector: str, patterns: str) -> str:
     return text
 
 
+
+# Compare structured/text content semantically; all other formats by exact bytes.
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".xml", ".yaml", ".yml", ".log",
+    ".css", ".js", ".ts", ".py", ".sh", ".ini", ".conf",
+    ".toml", ".svg", ".rss", ".atom", ".sql", ".jsonl", ".ndjson",
+}
+JSON_EXTENSIONS = {".json", ".jsonld", ".geojson"}
+HTML_EXTENSIONS = {".html", ".htm", ".xhtml"}
+
+
+def resource_details(url: str, content_type: str) -> tuple[str, str]:
+    """Return resource comparison kind and a safe snapshot extension."""
+    mime = content_type.split(";", 1)[0].strip().lower()
+    suffix = Path(urlsplit(url).path).suffix.lower()
+    valid_suffix = bool(re.fullmatch(r"\.[a-z0-9]{1,12}", suffix))
+
+    if suffix in JSON_EXTENSIONS or mime in ("application/json", "text/json") or mime.endswith("+json"):
+        kind = "json"
+    elif suffix in HTML_EXTENSIONS or mime in ("text/html", "application/xhtml+xml"):
+        kind = "html"
+    elif mime.startswith("text/") or mime.endswith("+xml") or mime in (
+        "application/xml", "application/javascript", "application/x-javascript"
+    ):
+        kind = "text"
+    elif suffix in JSON_EXTENSIONS:
+        kind = "json"
+    elif suffix in HTML_EXTENSIONS:
+        kind = "html"
+    elif suffix in TEXT_EXTENSIONS:
+        kind = "text"
+    elif mime:
+        kind = "binary"
+    else:
+        # Old servers often omit Content-Type. Preserve original HTML default.
+        kind = "html" if not valid_suffix else "binary"
+
+    if valid_suffix:
+        ext = suffix
+    elif kind == "html":
+        ext = ".html"
+    elif kind == "json":
+        ext = ".json"
+    elif kind == "text":
+        ext = mimetypes.guess_extension(mime) or ".txt"
+        if not re.fullmatch(r"\.[a-z0-9]{1,12}", ext):
+            ext = ".txt"
+    else:
+        ext = ".bin"
+    return kind, ext
+
+
+def comparable_content(payload: bytes, kind: str, mode: str,
+                       selector: str, patterns: str) -> str:
+    """Generate comparison text, keeping downloaded files byte-for-byte intact."""
+    if kind == "html":
+        return clean_html(payload, mode, selector, patterns)
+
+    if kind == "binary":
+        # No lossy decoding for arbitrary PDFs, archives, images, executables, etc.
+        if selector or patterns:
+            raise ValueError("CSS/regex filters cannot be used on binary resources.")
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Text/JSON resource is not UTF-8; cannot compare safely.") from exc
+
+    if kind == "json":
+        if selector:
+            raise ValueError("CSS selectors only apply to HTML resources.")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON returned by server: {exc}") from exc
+        # Formatting / key order should not generate false positives.
+        text = json.dumps(data, sort_keys=True, ensure_ascii=False, indent=2)
+    elif selector:
+        raise ValueError("CSS selectors only apply to HTML resources.")
+
+    for pattern in patterns.splitlines():
+        pattern = pattern.strip()
+        if pattern:
+            try:
+                text = re.sub(pattern, "", text, flags=re.MULTILINE)
+            except re.error as exc:
+                raise ValueError(f"Invalid regular expression ({pattern}): {exc}") from exc
+    if not text.strip():
+        raise ValueError("No comparable content found: reference not updated.")
+    return text
+
+
 def diff_preview(before: str, after: str) -> list[str]:
     output = difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="")
     return [line[:250] for line in output if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))][:8]
@@ -157,7 +251,7 @@ def curl_binary() -> str | None:
 
 
 class FetchWorker(QObject):
-    success = Signal(bytes, str, int, str)
+    success = Signal(bytes, str, int, str, str)
     failure = Signal(str, int)
     finished = Signal()
 
@@ -165,7 +259,7 @@ class FetchWorker(QObject):
         super().__init__()
         self.url = url
 
-    def fetch_with_curl(self) -> tuple[bytes, str, int]:
+    def fetch_with_curl(self) -> tuple[bytes, str, int, str]:
         """Single, bounded cURL fallback after an HTTPX 403 response."""
         executable = curl_binary()
         if not executable:
@@ -174,7 +268,7 @@ class FetchWorker(QObject):
         # Save to a temporary file: never buffer a large response on stdout.
         # curl --max-filesize caps the response even when Content-Length is absent.
         with tempfile.TemporaryDirectory(prefix="pagesentinel_") as directory:
-            output = Path(directory) / "response.html"
+            output = Path(directory) / "response.data"
             command = [
                 executable,
                 "--silent", "--show-error", "--location",
@@ -182,7 +276,7 @@ class FetchWorker(QObject):
                 "--connect-timeout", "10", "--max-time", "30",
                 "--max-filesize", str(MAX_BYTES),
                 "--user-agent", FIREFOX_UA,
-                "--header", "Accept: text/html,application/xhtml+xml",
+                "--header", "Accept: */*",
                 "--output", str(output),
                 "--write-out", "%{http_code}\n%{url_effective}\n%{content_type}",
                 "--", self.url,
@@ -209,15 +303,12 @@ class FetchWorker(QObject):
                 )
             if status != 200:
                 raise RuntimeError(f"Unexpected cURL HTTP {status}: {final_url}")
-            if content_type and "html" not in content_type:
-                raise ValueError(f"Non-HTML resource ({content_type}).")
             if not output.exists():
                 raise RuntimeError("cURL returned no page data.")
             if output.stat().st_size > MAX_BYTES:
                 raise ValueError(f"Page too large (maximum {MAX_PAGE_SIZE_MB} MB).")
             payload = output.read_bytes()
-            # Existing PageSentinel snapshots are stored as UTF-8.
-            return payload.decode("utf-8", errors="replace").encode("utf-8"), final_url, status
+            return payload, final_url, status, content_type
 
     @Slot()
     def run(self):
@@ -228,7 +319,7 @@ class FetchWorker(QObject):
                 max_redirects=5,
                 headers={
                     "User-Agent": FIREFOX_UA,
-                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept": "*/*",
                 },
             ) as client:
                 with client.stream("GET", self.url) as response:
@@ -236,8 +327,8 @@ class FetchWorker(QObject):
                     if status == 403:
                         # A single fallback per scheduled check, not a retry loop.
                         try:
-                            payload, final_url, curl_status = self.fetch_with_curl()
-                            self.success.emit(payload, final_url, curl_status, "cURL fallback")
+                            payload, final_url, curl_status, content_type = self.fetch_with_curl()
+                            self.success.emit(payload, final_url, curl_status, "cURL fallback", content_type)
                         except CurlHTTPError as exc:
                             self.failure.emit(
                                 f"HTTPX 403; {exc} (fallback unsuccessful)", exc.status
@@ -250,19 +341,12 @@ class FetchWorker(QObject):
 
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "").lower()
-                    if content_type and "html" not in content_type:
-                        raise ValueError(f"Non-HTML resource ({content_type}).")
                     chunks = bytearray()
                     for chunk in response.iter_bytes():
                         if len(chunks) + len(chunk) > MAX_BYTES:
                             raise ValueError(f"Page too large (maximum {MAX_PAGE_SIZE_MB} MB).")
                         chunks.extend(chunk)
-                    source_encoding = response.encoding or "utf-8"
-                    try:
-                        text = bytes(chunks).decode(source_encoding, errors="replace")
-                    except LookupError:
-                        text = bytes(chunks).decode("utf-8", errors="replace")
-                    self.success.emit(text.encode("utf-8"), str(response.url), status, "HTTPX")
+                    self.success.emit(bytes(chunks), str(response.url), status, "HTTPX", content_type)
         except httpx.HTTPStatusError as exc:
             self.failure.emit(f"HTTP {exc.response.status_code} : {exc.request.url}", exc.response.status_code)
         except Exception as exc:
@@ -320,9 +404,9 @@ class ResultRelay(QObject):
         self.monitor = monitor
         self.generation = generation
 
-    @Slot(bytes, str, int, str)
-    def on_success(self, payload, final_url, status_code, client_name):
-        self.window.handle_content(self.monitor, self.generation, payload, final_url, status_code, client_name)
+    @Slot(bytes, str, int, str, str)
+    def on_success(self, payload, final_url, status_code, client_name, content_type):
+        self.window.handle_content(self.monitor, self.generation, payload, final_url, status_code, client_name, content_type)
 
     @Slot(str, int)
     def on_failure(self, message, status_code):
@@ -358,7 +442,7 @@ class AlertHighlighter(QSyntaxHighlighter):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PageSentinel v2.3")
+        self.setWindowTitle("PageSentinel v2.4")
         self.resize(1030, 700)
         self.monitors: list[Monitor] = []
         self.closing = False
@@ -457,8 +541,8 @@ class MainWindow(QMainWindow):
         else:
             self.log.appendPlainText(f"[{stamp}] {message}")
 
-    def current_path(self, monitor: Monitor) -> Path:
-        return storage_dir() / f"{monitor.prefix}_current.html"
+    def current_path(self, monitor: Monitor, extension: str = ".html") -> Path:
+        return storage_dir() / f"{monitor.prefix}_current{extension}"
 
     def add_monitor(self):
         try:
@@ -613,17 +697,18 @@ class MainWindow(QMainWindow):
         monitor.thread.start()
         self.refresh_table()
 
-    def handle_content(self, monitor: Monitor, generation: int, payload: bytes, final_url: str, status_code: int, client_name: str):
+    def handle_content(self, monitor: Monitor, generation: int, payload: bytes, final_url: str, status_code: int, client_name: str, content_type: str):
         if not monitor.active or generation != monitor.generation:
             return
         monitor.checks += 1
         self.record(f"{monitor.url} — HTTP {status_code} via {client_name}.")
-        current = self.current_path(monitor)
         try:
-            fresh = clean_html(payload, monitor.mode, monitor.selector, monitor.patterns)
+            kind, extension = resource_details(final_url, content_type)
+            current = self.current_path(monitor, extension)
+            fresh = comparable_content(payload, kind, monitor.mode, monitor.selector, monitor.patterns)
             if not current.exists():
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                initial = storage_dir() / f"{monitor.prefix}_{stamp}.html"
+                initial = storage_dir() / f"{monitor.prefix}_{stamp}{extension}"
                 with initial.open("xb") as handle:
                     handle.write(payload)
                 atomic_write(current, payload)
@@ -631,7 +716,7 @@ class MainWindow(QMainWindow):
                 self.record(f"{monitor.url} — initial snapshot: {initial.name}")
                 self.record(f"Current reference: {current.name}")
             else:
-                old = clean_html(current.read_bytes(), monitor.mode, monitor.selector, monitor.patterns)
+                old = comparable_content(current.read_bytes(), kind, monitor.mode, monitor.selector, monitor.patterns)
                 if old == fresh:
                     monitor.pending_hash = ""
                     monitor.pending_count = 0
@@ -648,7 +733,7 @@ class MainWindow(QMainWindow):
                         monitor.status = f"Pending confirmation ({monitor.pending_count}/{monitor.confirmations})"
                         self.record(f"{monitor.url} — change awaiting confirmation ({monitor.pending_count}/{monitor.confirmations}).")
                     else:
-                        changes = diff_preview(old, fresh)
+                        changes = diff_preview(old, fresh) if kind != "binary" else ["Binary content changed (SHA-256 differs)."]
                         atomic_write(current, payload)
                         monitor.changes += 1
                         monitor.pending_hash = ""
